@@ -70,146 +70,123 @@ public class DefaultProjectDependenciesResolver
     public DependencyResolutionResult resolve( DependencyResolutionRequest request )
         throws DependencyResolutionException
     {
-        final RequestTrace trace = RequestTrace.newChild( null, request );
+        synchronized (DefaultProjectDependenciesResolver.class) {
+            final RequestTrace trace = RequestTrace.newChild(null, request);
 
-        final DefaultDependencyResolutionResult result = new DefaultDependencyResolutionResult();
+            final DefaultDependencyResolutionResult result = new DefaultDependencyResolutionResult();
 
-        final MavenProject project = request.getMavenProject();
-        final DependencyFilter filter = request.getResolutionFilter();
-        RepositorySystemSession session = request.getRepositorySession();
-        ArtifactTypeRegistry stereotypes = session.getArtifactTypeRegistry();
+            final MavenProject project = request.getMavenProject();
+            final DependencyFilter filter = request.getResolutionFilter();
+            RepositorySystemSession session = request.getRepositorySession();
+            ArtifactTypeRegistry stereotypes = session.getArtifactTypeRegistry();
 
-        if ( logger.isDebugEnabled()
-            && session.getConfigProperties().get( DependencyManagerUtils.CONFIG_PROP_VERBOSE ) == null )
-        {
-            DefaultRepositorySystemSession verbose = new DefaultRepositorySystemSession( session );
-            verbose.setConfigProperty( DependencyManagerUtils.CONFIG_PROP_VERBOSE, Boolean.TRUE );
-            session = verbose;
-        }
-
-        for ( RepositorySessionDecorator decorator : decorators )
-        {
-            RepositorySystemSession decorated = decorator.decorate( project, session );
-            if ( decorated != null )
-            {
-                session = decorated;
+            if (logger.isDebugEnabled()
+                    && session.getConfigProperties().get(DependencyManagerUtils.CONFIG_PROP_VERBOSE) == null) {
+                DefaultRepositorySystemSession verbose = new DefaultRepositorySystemSession(session);
+                verbose.setConfigProperty(DependencyManagerUtils.CONFIG_PROP_VERBOSE, Boolean.TRUE);
+                session = verbose;
             }
-        }
 
-        CollectRequest collect = new CollectRequest();
-        collect.setRootArtifact( RepositoryUtils.toArtifact( project.getArtifact() ) );
-        collect.setRequestContext( "project" );
-        collect.setRepositories( project.getRemoteProjectRepositories() );
-
-        if ( project.getDependencyArtifacts() == null )
-        {
-            for ( Dependency dependency : project.getDependencies() )
-            {
-                if ( StringUtils.isEmpty( dependency.getGroupId() ) || StringUtils.isEmpty( dependency.getArtifactId() )
-                    || StringUtils.isEmpty( dependency.getVersion() ) )
-                {
-                    // guard against case where best-effort resolution for invalid models is requested
-                    continue;
+            for (RepositorySessionDecorator decorator : decorators) {
+                RepositorySystemSession decorated = decorator.decorate(project, session);
+                if (decorated != null) {
+                    session = decorated;
                 }
-                collect.addDependency( RepositoryUtils.toDependency( dependency, stereotypes ) );
             }
-        }
-        else
-        {
-            Map<String, Dependency> dependencies = new HashMap<>();
-            for ( Dependency dependency : project.getDependencies() )
-            {
-                String classifier = dependency.getClassifier();
-                if ( classifier == null )
-                {
-                    ArtifactType type = stereotypes.get( dependency.getType() );
-                    if ( type != null )
-                    {
-                        classifier = type.getClassifier();
+
+            CollectRequest collect = new CollectRequest();
+            collect.setRootArtifact(RepositoryUtils.toArtifact(project.getArtifact()));
+            collect.setRequestContext("project");
+            collect.setRepositories(project.getRemoteProjectRepositories());
+
+            if (project.getDependencyArtifacts() == null) {
+                for (Dependency dependency : project.getDependencies()) {
+                    if (StringUtils.isEmpty(dependency.getGroupId()) || StringUtils.isEmpty(dependency.getArtifactId())
+                            || StringUtils.isEmpty(dependency.getVersion())) {
+                        // guard against case where best-effort resolution for invalid models is requested
+                        continue;
+                    }
+                    collect.addDependency(RepositoryUtils.toDependency(dependency, stereotypes));
+                }
+            } else {
+                Map<String, Dependency> dependencies = new HashMap<>();
+                for (Dependency dependency : project.getDependencies()) {
+                    String classifier = dependency.getClassifier();
+                    if (classifier == null) {
+                        ArtifactType type = stereotypes.get(dependency.getType());
+                        if (type != null) {
+                            classifier = type.getClassifier();
+                        }
+                    }
+                    String key =
+                            ArtifactIdUtils.toVersionlessId(dependency.getGroupId(), dependency.getArtifactId(),
+                                    dependency.getType(), classifier);
+                    dependencies.put(key, dependency);
+                }
+                for (Artifact artifact : project.getDependencyArtifacts()) {
+                    String key = artifact.getDependencyConflictId();
+                    Dependency dependency = dependencies.get(key);
+                    Collection<Exclusion> exclusions = dependency != null ? dependency.getExclusions() : null;
+                    org.eclipse.aether.graph.Dependency dep = RepositoryUtils.toDependency(artifact, exclusions);
+                    if (!JavaScopes.SYSTEM.equals(dep.getScope()) && dep.getArtifact().getFile() != null) {
+                        // enable re-resolution
+                        org.eclipse.aether.artifact.Artifact art = dep.getArtifact();
+                        art = art.setFile(null).setVersion(art.getBaseVersion());
+                        dep = dep.setArtifact(art);
+                    }
+                    collect.addDependency(dep);
+                }
+            }
+
+            DependencyManagement depMgmt = project.getDependencyManagement();
+            if (depMgmt != null) {
+                for (Dependency dependency : depMgmt.getDependencies()) {
+                    collect.addManagedDependency(RepositoryUtils.toDependency(dependency, stereotypes));
+                }
+            }
+
+            DependencyRequest depRequest = new DependencyRequest(collect, filter);
+            depRequest.setTrace(trace);
+
+            DependencyNode node;
+            try {
+                collect.setTrace(RequestTrace.newChild(trace, depRequest));
+                node = repoSystem.collectDependencies(session, collect).getRoot();
+                result.setDependencyGraph(node);
+            } catch (DependencyCollectionException e) {
+                result.setDependencyGraph(e.getResult().getRoot());
+                result.setCollectionErrors(e.getResult().getExceptions());
+
+                throw new DependencyResolutionException(result, "Could not resolve dependencies for project "
+                        + project.getId() + ": " + e.getMessage(), e);
+            }
+
+            depRequest.setRoot(node);
+
+            if (logger.isWarnEnabled()) {
+                for (DependencyNode child : node.getChildren()) {
+                    if (!child.getRelocations().isEmpty()) {
+                        logger.warn("The artifact " + child.getRelocations().get(0) + " has been relocated to "
+                                + child.getDependency().getArtifact());
                     }
                 }
-                String key =
-                    ArtifactIdUtils.toVersionlessId( dependency.getGroupId(), dependency.getArtifactId(),
-                                                    dependency.getType(), classifier );
-                dependencies.put( key, dependency );
             }
-            for ( Artifact artifact : project.getDependencyArtifacts() )
-            {
-                String key = artifact.getDependencyConflictId();
-                Dependency dependency = dependencies.get( key );
-                Collection<Exclusion> exclusions = dependency != null ? dependency.getExclusions() : null;
-                org.eclipse.aether.graph.Dependency dep = RepositoryUtils.toDependency( artifact, exclusions );
-                if ( !JavaScopes.SYSTEM.equals( dep.getScope() ) && dep.getArtifact().getFile() != null )
-                {
-                    // enable re-resolution
-                    org.eclipse.aether.artifact.Artifact art = dep.getArtifact();
-                    art = art.setFile( null ).setVersion( art.getBaseVersion() );
-                    dep = dep.setArtifact( art );
-                }
-                collect.addDependency( dep );
+
+            if (logger.isDebugEnabled()) {
+                node.accept(new GraphLogger(project));
             }
-        }
 
-        DependencyManagement depMgmt = project.getDependencyManagement();
-        if ( depMgmt != null )
-        {
-            for ( Dependency dependency : depMgmt.getDependencies() )
-            {
-                collect.addManagedDependency( RepositoryUtils.toDependency( dependency, stereotypes ) );
+            try {
+                process(result, repoSystem.resolveDependencies(session, depRequest).getArtifactResults());
+            } catch (org.eclipse.aether.resolution.DependencyResolutionException e) {
+                process(result, e.getResult().getArtifactResults());
+
+                throw new DependencyResolutionException(result, "Could not resolve dependencies for project "
+                        + project.getId() + ": " + e.getMessage(), e);
             }
+
+            return result;
         }
-
-        DependencyRequest depRequest = new DependencyRequest( collect, filter );
-        depRequest.setTrace( trace );
-
-        DependencyNode node;
-        try
-        {
-            collect.setTrace( RequestTrace.newChild( trace, depRequest ) );
-            node = repoSystem.collectDependencies( session, collect ).getRoot();
-            result.setDependencyGraph( node );
-        }
-        catch ( DependencyCollectionException e )
-        {
-            result.setDependencyGraph( e.getResult().getRoot() );
-            result.setCollectionErrors( e.getResult().getExceptions() );
-
-            throw new DependencyResolutionException( result, "Could not resolve dependencies for project "
-                + project.getId() + ": " + e.getMessage(), e );
-        }
-
-        depRequest.setRoot( node );
-
-        if ( logger.isWarnEnabled() )
-        {
-            for ( DependencyNode child : node.getChildren() )
-            {
-                if ( !child.getRelocations().isEmpty() )
-                {
-                    logger.warn( "The artifact " + child.getRelocations().get( 0 ) + " has been relocated to "
-                        + child.getDependency().getArtifact() );
-                }
-            }
-        }
-
-        if ( logger.isDebugEnabled() )
-        {
-            node.accept( new GraphLogger( project ) );
-        }
-
-        try
-        {
-            process( result, repoSystem.resolveDependencies( session, depRequest ).getArtifactResults() );
-        }
-        catch ( org.eclipse.aether.resolution.DependencyResolutionException e )
-        {
-            process( result, e.getResult().getArtifactResults() );
-
-            throw new DependencyResolutionException( result, "Could not resolve dependencies for project "
-                + project.getId() + ": " + e.getMessage(), e );
-        }
-
-        return result;
     }
 
     private void process( DefaultDependencyResolutionResult result, Collection<ArtifactResult> results )
